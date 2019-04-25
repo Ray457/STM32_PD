@@ -2,14 +2,39 @@
 #include "pd_phy.h"
 #include "pd.h"	// for GoodCRC and headers
 
-// Configuration Start ---------------------------------------------------
-#define PD_PHY_DETECT_ALL_SOP
 // Rx GPIO Configuration ----------------------------------
+#ifdef CONFIG_PD_USE_INTERNAL_COMP
+#define PD_COMP_PIN1 (((uint16_t)0x0001U) << 22)	// COMP2 Output -> EXTI 22
+#define PD_COMP_PIN2 PD_COMP_PIN1
+#else
 #define PD_COMP_PIN1_ID 0 // PB0 as TIM3_CH3 during Rx
 #define PD_COMP_PIN2_ID 1 // PB1 as TIM3_CH4 during Rx
 #define PD_COMP_PIN1 (((uint16_t)0x0001U) << PD_COMP_PIN1_ID)
 #define PD_COMP_PIN2 (((uint16_t)0x0001U) << PD_COMP_PIN2_ID)
 #define PD_COMP_GPIO GPIOB
+#endif
+
+#ifdef CONFIG_PD_USE_INTERNAL_COMP
+// Rx EXTI Configuration ----------------------------------
+#define PD_COMP_EXTI ADC1_COMP_IRQn	// EXTI 22, COMP2 Output
+// Rx Timer Configuration ---------------------------------
+// RM0091 page 446, IC1 = TI1FP1 input
+#define PD_RX_CCMR_CC1() (TIM3->CCMR1 = 0x0001)
+#define PD_RX_CCMR_CC2() PD_RX_CCMR_CC1()
+// RM0091 page 450, CC1E=1, Capture enabled
+// CC1NP=1, CC1P=1, IC1 falling/rising sensitive
+#define PD_RX_CCER_EN() (TIM3->CCER = 0x000B)
+#define PD_RX_CCER_DIS() (TIM3->CCER &= ~0x000F)
+// RM0091 page 444, Enable update CC1 generation
+#define PD_RX_EGR_UPDATE()	(TIM3->EGR = 0x3)	// CC1G, UG
+// RM0091 page 441, Enable DMA request for IC1
+#define PD_RX_DIER_SET() (TIM3->DIER = 0x0200)
+// Rx DMA Configuration -----------------------------------
+#define PD_RX_DMA_SRCADDR (&(TIM3->CCR1))
+#define PD_RX_DMA_CHANNEL DMA1_Channel4		// TIM3_CH1
+#define PD_RX_DMA_CLR_ISR() (DMA1->IFCR = 0xF000)
+// Configuration End -----------------------------------------------------
+#else
 // Rx EXTI Configuration ----------------------------------
 #define PD_COMP_EXTI EXTI0_1_IRQn
 // Rx Timer Configuration ---------------------------------
@@ -21,17 +46,25 @@
 // CC4NP=1, CC4P=1, IC4 falling/rising
 #define PD_RX_CCER_EN() (TIM3->CCER = 0xB000)
 #define PD_RX_CCER_DIS() (TIM3->CCER &= ~0xF000)
+// RM0091 page 444, Enable update CC4 generation
+#define PD_RX_EGR_UPDATE()	(TIM3->EGR = 0x11)	// CC4G, UG
 // RM0091 page 441, Enable DMA request for IC4
 #define PD_RX_DIER_SET() (TIM3->DIER = 0x1000)
 // Rx DMA Configuration -----------------------------------
 #define PD_RX_DMA_SRCADDR (&(TIM3->CCR4))
 #define PD_RX_DMA_CHANNEL DMA1_Channel3		// TIM3_CH4
+#define PD_RX_DMA_CLR_ISR() (DMA1->IFCR = 0xF00)
 // Configuration End -----------------------------------------------------
+#endif
 
 // Configurations that should not be changed -----------------------------
 #define PD_RX_TIM_INCLK 48000000
 #define PD_COMP_MASK (PD_COMP_PIN1 | PD_COMP_PIN2)
+#ifdef CONFIG_PD_USE_INTERNAL_COMP
+#define PD_COMP_PIN(cc) (PD_COMP_PIN1)
+#else
 #define PD_COMP_PIN(cc) (cc==PD_CC_1 ? PD_COMP_PIN1 : PD_COMP_PIN2)
+#endif
 #define PD_RX_TIMEOUT() (TIM3->SR & 4)
 #define PD_TX_DMA_CHANNEL DMA1_Channel3		// SPI1_Tx
 #define PD_TX_DMA_IRQ DMA1_Channel2_3_IRQn
@@ -71,7 +104,7 @@ static int rx_edge_ts_idx;
 		^ (x &  8 ? 0x040 : 0x3C0) \
 		^ (x & 16 ? 0x100 : 0x300))
 
-#ifdef PD_PHY_DETECT_ALL_SOP
+#ifdef CONFIG_PD_DETECT_ALL_SOP
 static const uint16_t bmcsop[] = {
 	BMC(PD_SYNC1), BMC(PD_SYNC1), BMC(PD_SYNC1), BMC(PD_SYNC2),	// SOP
 	BMC(PD_SYNC1), BMC(PD_SYNC1), BMC(PD_SYNC3), BMC(PD_SYNC3),	// SOPP
@@ -79,7 +112,7 @@ static const uint16_t bmcsop[] = {
 	BMC(PD_SYNC1), BMC(PD_RST2), BMC(PD_RST2), BMC(PD_SYNC3),	// SOP_DBGP
 	BMC(PD_SYNC1), BMC(PD_RST2), BMC(PD_SYNC3), BMC(PD_SYNC2)	// SOP_DBGPP
 };
-#endif	// #ifdef PD_PHY_DETECT_ALL_SOP
+#endif	// #ifdef CONFIG_PD_DETECT_ALL_SOP
 
 enum pd_rx_special_4b5b {
 	TABLE_5b4b_SYNC1 = 16,
@@ -180,13 +213,21 @@ void pd_select_cc(uint8_t cc) {
 
 	    pd_selected_cc = PD_CC_1;
 
-		// Comparator GPIO1
+#ifdef CONFIG_PD_USE_INTERNAL_COMP
+	    // Comparator Setup
+		// COMP2+ to PA1 (Window Mode), High hysteresis, inverted output
+	    // !!! Window Mode requires both COMP1 and COMP2 to be enabled!
+		COMP->CSR |= COMP_CSR_WNDWEN | COMP_CSR_COMP2HYST_Msk | COMP_CSR_COMP2POL | COMP_CSR_COMP2EN | COMP_CSR_COMP1EN |
+				(6<<COMP_CSR_COMP2INSEL_Pos) | (6<<COMP_CSR_COMP2OUTSEL_Pos);
+#else
+		// External comparator on GPIO
 		PD_COMP_GPIO->MODER &=~ (0x03 << (PD_COMP_PIN1_ID<<1));	// Set to input
 		PD_COMP_GPIO->PUPDR &=~ (0x03 << (PD_COMP_PIN1_ID<<1));	// Clear pull-up/pull-down
 		PD_COMP_GPIO->PUPDR |= (0x01 << (PD_COMP_PIN1_ID<<1));	// Set to pull-up
 		// EXTI0 to PB
 		(*(SYSCFG->EXTICR + (PD_COMP_PIN1_ID >> 2))) &=~ ( (0x0FU) << ((PD_COMP_PIN1_ID&0x03U)<<2) );
 		(*(SYSCFG->EXTICR + (PD_COMP_PIN1_ID >> 2))) |= ( (GPIO_GET_INDEX(PD_COMP_GPIO)) << ((PD_COMP_PIN1_ID&0x03U)<<2) );
+#endif
 		EXTI->EMR &=~ PD_COMP_PIN1;
 		EXTI->IMR &=~ PD_COMP_PIN1;		// Disable the external interrupt
 		EXTI->RTSR &=~ PD_COMP_PIN1;	// Disable rising trigger
@@ -195,8 +236,8 @@ void pd_select_cc(uint8_t cc) {
 		PD_RX_CCER_DIS();
 		PD_RX_CCMR_CC1();
 		PD_RX_CCER_EN();
-		// RM0091 page 444, Enable update CC4 generation
-		TIM3->EGR = 0x11;
+		// RM0091 page 444, Enable update CCx generation
+		PD_RX_EGR_UPDATE();
 		// RM0091 page 442, Clear flags
 		TIM3->SR = 0;
 	} else if (cc == PD_CC_2) {	// CC2 is CC, PA6 is Tx
@@ -216,13 +257,22 @@ void pd_select_cc(uint8_t cc) {
 
 	    pd_selected_cc = PD_CC_2;
 
-		// Comparator GPIO2
+#ifdef CONFIG_PD_USE_INTERNAL_COMP
+	    // Comparator Setup
+		// COMP2+ to PA1 (Window Mode), High hysteresis, inverted output
+	    // COMP2- to PA4 (COMP2_INM4) with output inverted to TIM3_IC1
+	    // !!! Window Mode requires both COMP1 and COMP2 to be enabled!
+		COMP->CSR |= COMP_CSR_WNDWEN | COMP_CSR_COMP2HYST_Msk | COMP_CSR_COMP2POL | COMP_CSR_COMP2EN | COMP_CSR_COMP1EN |
+				(4<<COMP_CSR_COMP2INSEL_Pos) | (6<<COMP_CSR_COMP2OUTSEL_Pos);
+#else
+		// External comparator on GPIO
 		PD_COMP_GPIO->MODER &=~ (0x03 << (PD_COMP_PIN2_ID<<1));	// Set to input
 		PD_COMP_GPIO->PUPDR &=~ (0x03 << (PD_COMP_PIN2_ID<<1));	// Clear pull-up/pull-down
 		PD_COMP_GPIO->PUPDR |= (0x01 << (PD_COMP_PIN2_ID<<1));	// Set to pull-up
 		// EXTI0 to PB
 		(*(SYSCFG->EXTICR + (PD_COMP_PIN2_ID >> 2))) &=~ ( (0x0FU) << ((PD_COMP_PIN2_ID&0x03U)<<2) );
 		(*(SYSCFG->EXTICR + (PD_COMP_PIN2_ID >> 2))) |= ( (GPIO_GET_INDEX(PD_COMP_GPIO)) << ((PD_COMP_PIN2_ID&0x03U)<<2) );
+#endif
 		EXTI->EMR &=~ PD_COMP_PIN2;
 		EXTI->IMR &=~ PD_COMP_PIN2;		// Disable the external interrupt
 		EXTI->RTSR &=~ PD_COMP_PIN2;	// Disable rising trigger
@@ -231,8 +281,8 @@ void pd_select_cc(uint8_t cc) {
 		PD_RX_CCER_DIS();
 		PD_RX_CCMR_CC2();
 		PD_RX_CCER_EN();
-		// RM0091 page 444, Enable update CC4 generation
-		TIM3->EGR = 0x11;
+		// RM0091 page 444, Enable update CCx generation
+		PD_RX_EGR_UPDATE();
 		// RM0091 page 442, Clear flags
 		TIM3->SR = 0;
 	} else {
@@ -240,6 +290,12 @@ void pd_select_cc(uint8_t cc) {
 		GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
 		GPIO_InitStruct.Pull = GPIO_NOPULL;
 		HAL_GPIO_Init(PD_CC_GPIO, &GPIO_InitStruct);
+
+#ifdef CONFIG_PD_USE_INTERNAL_COMP
+		// PA1 - Analog, for comparator reference
+		GPIO_InitStruct.Pin = GPIO_PIN_1;
+		HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+#endif
 
 		// PA6, PB4 to Hi-Z
 		GPIO_InitStruct.Pin = GPIO_PIN_6;
@@ -252,9 +308,13 @@ void pd_select_cc(uint8_t cc) {
 
 		pd_selected_cc = PD_CC_NC;
 
-		// Disable Comparator IT
+		// Disable Comparator
+#ifdef CONFIG_PD_USE_INTERNAL_COMP
+		COMP->CSR &=~ 0xFFFF0000;	// Reset and disable COMP2
+#else
 		GPIO_InitStruct.Pin = PD_COMP_MASK;
 		HAL_GPIO_Init(PD_COMP_GPIO, &GPIO_InitStruct);
+#endif
 	}
 }
 
@@ -401,6 +461,7 @@ void pd_phy_rx_start() {
 	raw_samples = (uint8_t*) raw_samples_buf;
 	rx_bytes = (uint8_t*) raw_samples_buf - 32;
 
+#ifndef CONFIG_PD_USE_INTERNAL_COMP
 	// Comparator GPIO -> Alternate function mode (for TIM3_CH4)
 	GPIO_InitTypeDef GPIO_InitStruct;
     GPIO_InitStruct.Pin = PD_COMP_PIN(pd_selected_cc);
@@ -409,11 +470,12 @@ void pd_phy_rx_start() {
     GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
     GPIO_InitStruct.Alternate = GPIO_AF1_TIM3;
     HAL_GPIO_Init(PD_COMP_GPIO, &GPIO_InitStruct);
+#endif
 
 	// Disable DMA
 	PD_RX_DMA_CHANNEL->CCR = 0;
 	// Clear ISR
-	DMA1->IFCR = 0xF00;
+	PD_RX_DMA_CLR_ISR();
 
 	// Enable Rx timer's DMA request
 	PD_RX_DIER_SET();
@@ -460,7 +522,7 @@ static inline uint8_t find_preamble(void) {
 
 		all = (all >> 1) | (cnt <= PD_RX_THRESHOLD ? 1 << 31 : 0);
 
-#ifdef PD_PHY_DETECT_ALL_SOP
+#ifdef CONFIG_PD_DETECT_ALL_SOP
 		if (all == 0x36DB6DB6) {
 			raw_ptr--;
 #else
@@ -470,16 +532,19 @@ static inline uint8_t find_preamble(void) {
 			return PD_RX_SOP;				// Potential SOP* packet
 		} else if (all == 0xF33F3F3F) {
 			return PD_RX_ERR_HARD_RESET;	// Got Hard-Reset
-		} else if (all == 0x3c7fe0ff) {
+		}
+#ifdef CONFIG_PD_DETECT_ALL_SOP
+		else if (all == 0x3C7FE0FF) {
 			return PD_RX_ERR_CABLE_RESET;	// Got Cable-Reset
 		}
+#endif
 
 		raw_ptr++;
 	}
 
 		/*
-		Explanation to the magic numbers:
-		1. The timer and comparator setup determines that, raw_samples[] contains number which is proportional to the width of pulses
+		Explanation of the magic numbers:
+		1. The timer and comparator setup determines that, numbers in raw_samples[] are proportional to the pulse width
 		2. "all = (all >> 1) | (cnt <= PERIOD_THRESHOLD ? 1 << 31 : 0);" gives 1 for narrow pulses and 0 for wide pulses
 		3. According to BMC encoding (refer to USD PD specification),
 			a data 1 is a transition in the middle of a frame
@@ -614,7 +679,7 @@ static inline uint8_t pd_rx_decode_byte(void) {
 static inline uint8_t pd_rx_process(void) {
 	uint8_t sop = find_preamble();
 	if (sop == PD_RX_SOP) {
-#ifdef PD_PHY_DETECT_ALL_SOP
+#ifdef CONFIG_PD_DETECT_ALL_SOP
 		uint8_t kcode1 = pd_rx_decode_byte();
 		uint8_t kcode2 = pd_rx_decode_byte();
 		uint8_t kcode3 = pd_rx_decode_byte();
@@ -641,7 +706,7 @@ static inline uint8_t pd_rx_process(void) {
 	} else if (sop ==PD_RX_ERR_HARD_RESET) {
 		return PD_RX_ERR_HARD_RESET;
 	}
-#ifdef PD_PHY_DETECT_ALL_SOP
+#ifdef CONFIG_PD_DETECT_ALL_SOP
 	else if (sop == PD_RX_ERR_CABLE_RESET) {
 		return PD_RX_ERR_CABLE_RESET;
 	}
@@ -710,7 +775,7 @@ void pd_rx_isr_handler(void) {
 	uint32_t pd_comp_pin = PD_COMP_PIN(pd_selected_cc);
 
 	// See RM0091 page 214 & EXTI_PR
-	if(__HAL_GPIO_EXTI_GET_IT(pd_comp_pin) != RESET) {
+	if(EXTI->PR &(pd_comp_pin)) {
 		rx_edge_ts[rx_edge_ts_idx] = timestamp_get();
 		next_idx = (rx_edge_ts_idx == PD_RX_TRANSITION_COUNT - 1) ?
 					0 : rx_edge_ts_idx + 1;
@@ -960,7 +1025,7 @@ void pd_prepare_message(uint8_t sop_type, uint8_t cnt, const uint8_t* data) {
 
 	write_preamble();
 
-#ifdef PD_PHY_DETECT_ALL_SOP
+#ifdef CONFIG_PD_DETECT_ALL_SOP
 	// Write SOP
 	for (i = 0; i < 4; i++)
 		write_sym(bmcsop[i+(sop_type<<2)]);
